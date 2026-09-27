@@ -192,8 +192,15 @@ class RadioDB:
             )
         return int(cur.lastrowid)
 
-    def _validate_slot(self, air_date: str, start_time: str, duration: int, program_id: int,
-                       region: str, ignore_slot_id: int | None = None) -> None:
+    def _slot_issues(self, air_date: str, start_time: str, duration: int, program_id: int,
+                     region: str, ignore_slot_id: int | None = None) -> list[dict]:
+        """Collect every scheduling-rule violation for a (would-be) slot.
+
+        Hard input problems (bad formats, unknown program) still raise
+        DomainError; rule violations are returned as {"category", "detail"}
+        issues in the historical check order so callers can report all of
+        them. Cooldown/sponsor issues also carry a "remaining" minute count.
+        """
         try:
             day = datetime.strptime(air_date, "%Y-%m-%d").date()
         except ValueError as exc:
@@ -207,14 +214,15 @@ class RadioDB:
         program = self.conn.execute("SELECT * FROM programs WHERE id=? AND active=1", (program_id,)).fetchone()
         if not program:
             raise DomainError("节目不存在或未启用")
+        issues: list[dict] = []
         if program["duration_minutes"] != duration:
-            raise DomainError(f"排期时长必须等于节目时长 {program['duration_minutes']} 分钟")
+            issues.append({"category": "时长", "detail": f"排期时长必须等于节目时长 {program['duration_minutes']} 分钟"})
         if not (program["start_date"] <= air_date <= program["end_date"]):
-            raise DomainError("播出日期超出授权窗口")
+            issues.append({"category": "版权", "detail": "播出日期超出授权窗口"})
         if not self.conn.execute(
             "SELECT 1 FROM program_regions WHERE program_id=? AND region=?", (program_id, region)
         ).fetchone():
-            raise DomainError(f"节目未授权在{region}播出")
+            issues.append({"category": "版权", "detail": f"节目未授权在{region}播出"})
         end_minutes = _minutes(start_time) + duration
         blocked = self.conn.execute(
             "SELECT * FROM blocked_windows WHERE region=? AND weekday=?",
@@ -222,7 +230,7 @@ class RadioDB:
         ).fetchall()
         for window in blocked:
             if _minutes(window["start_time"]) < end_minutes and _minutes(start_time) < _minutes(window["end_time"]):
-                raise DomainError(f"与禁播时段冲突: {window['reason']}")
+                issues.append({"category": "禁播", "detail": f"与禁播时段冲突: {window['reason']}"})
         sql = "SELECT * FROM slots WHERE air_date=? AND region=? AND status!='cancelled'"
         params: list[object] = [air_date, region]
         if ignore_slot_id is not None:
@@ -230,7 +238,7 @@ class RadioDB:
             params.append(ignore_slot_id)
         for existing in self.conn.execute(sql, params).fetchall():
             if _overlap(start_time, duration, existing["start_time"], existing["duration_minutes"]):
-                raise DomainError(f"与排期 #{existing['id']} 时间重叠")
+                issues.append({"category": "时间冲突", "detail": f"与排期 #{existing['id']} 时间重叠"})
         if program["cooldown_minutes"]:
             previous = self.conn.execute(
                 "SELECT * FROM slots WHERE air_date=? AND region=? AND program_id=? AND status!='cancelled' AND id!=? "
@@ -240,7 +248,9 @@ class RadioDB:
             if previous:
                 gap = _minutes(start_time) - (_minutes(previous["start_time"]) + previous["duration_minutes"])
                 if gap < program["cooldown_minutes"]:
-                    raise DomainError(f"与上一期节目间隔不足冷却时间 {program['cooldown_minutes']} 分钟")
+                    remaining = program["cooldown_minutes"] - gap
+                    issues.append({"category": "节目冷却", "remaining": remaining,
+                                   "detail": f"与上一期节目间隔不足冷却时间 {program['cooldown_minutes']} 分钟，还差 {remaining} 分钟"})
         if program["sponsor"]:
             policy = self.conn.execute("SELECT min_gap_minutes FROM sponsor_policies WHERE sponsor=?", (program["sponsor"],)).fetchone()
             if policy:
@@ -252,10 +262,19 @@ class RadioDB:
                 ).fetchall()
                 for other in all_sponsored:
                     if _overlap(start_time, duration, other["start_time"], other["duration_minutes"]):
-                        raise DomainError(f"与赞助商 {program['sponsor']} 的其他节目冲突")
+                        issues.append({"category": "赞助规则", "detail": f"与赞助商 {program['sponsor']} 的其他节目冲突"})
+                        continue
                     distance = abs(_minutes(start_time) - (_minutes(other["start_time"]) + other["duration_minutes"]))
                     if distance < gap:
-                        raise DomainError(f"与赞助商 {program['sponsor']} 的节目间隔不足 {gap} 分钟")
+                        issues.append({"category": "赞助规则", "remaining": gap - distance,
+                                       "detail": f"与赞助商 {program['sponsor']} 的节目间隔不足 {gap} 分钟，还差 {gap - distance} 分钟"})
+        return issues
+
+    def _validate_slot(self, air_date: str, start_time: str, duration: int, program_id: int,
+                       region: str, ignore_slot_id: int | None = None) -> None:
+        issues = self._slot_issues(air_date, start_time, duration, program_id, region, ignore_slot_id)
+        if issues:
+            raise DomainError(issues[0]["detail"])
 
     def schedule_slot(self, air_date: str, start_time: str, program_id: int, region: str) -> int:
         program = self.conn.execute("SELECT duration_minutes FROM programs WHERE id=?", (program_id,)).fetchone()
@@ -284,6 +303,109 @@ class RadioDB:
                 (new_program_id, int(program["duration_minutes"]), slot["program_id"], slot_id),
             )
         return self.get_slot(slot_id)
+
+    def _spacing(self, air_date: str, start_time: str, program, region: str, ignore_slot_id: int) -> dict:
+        """Cooldown/sponsor spacing numbers for a candidate at a slot's time.
+
+        *_remaining is how many minutes are still missing to satisfy the rule
+        (0 = satisfied); *_margin is the slack beyond the requirement, or None
+        when the rule does not apply at all.
+        """
+        spacing = {"cooldown_remaining": 0, "cooldown_margin": None,
+                   "sponsor_remaining": 0, "sponsor_margin": None}
+        if program["cooldown_minutes"]:
+            previous = self.conn.execute(
+                "SELECT * FROM slots WHERE air_date=? AND region=? AND program_id=? AND status!='cancelled' AND id!=? "
+                "AND start_time < ? ORDER BY start_time DESC LIMIT 1",
+                (air_date, region, program["id"], ignore_slot_id, start_time),
+            ).fetchone()
+            if previous:
+                gap = _minutes(start_time) - (_minutes(previous["start_time"]) + previous["duration_minutes"])
+                spacing["cooldown_remaining"] = max(0, program["cooldown_minutes"] - gap)
+                spacing["cooldown_margin"] = gap - program["cooldown_minutes"]
+        if program["sponsor"]:
+            policy = self.conn.execute("SELECT min_gap_minutes FROM sponsor_policies WHERE sponsor=?", (program["sponsor"],)).fetchone()
+            if policy:
+                min_gap = policy["min_gap_minutes"]
+                distances = []
+                for other in self.conn.execute(
+                    "SELECT s.* FROM slots s JOIN programs p ON p.id=s.program_id "
+                    "WHERE s.air_date=? AND s.region=? AND s.status!='cancelled' AND p.sponsor=? AND s.id!=?",
+                    (air_date, region, program["sponsor"], ignore_slot_id),
+                ).fetchall():
+                    if _overlap(start_time, program["duration_minutes"], other["start_time"], other["duration_minutes"]):
+                        distances.append(0)
+                    else:
+                        distances.append(abs(_minutes(start_time) - (_minutes(other["start_time"]) + other["duration_minutes"])))
+                if distances:
+                    nearest = min(distances)
+                    spacing["sponsor_remaining"] = max(0, min_gap - nearest)
+                    spacing["sponsor_margin"] = nearest - min_gap
+        return spacing
+
+    # Sorting weight for "the rule does not apply", i.e. unconstrained = safest.
+    _UNCONSTRAINED = 10 ** 9
+
+    def suggest_replacements(self, slot_id: int) -> dict:
+        """Rank safe same-length replacements for a not-yet-aired slot.
+
+        Candidates are programs that would pass the existing replace
+        validation at the slot's own date/region/time, sorted by their
+        cooldown/sponsor remaining slack (safest first). Rejected programs
+        carry the blocking reasons; when nothing is usable, "blocked_by"
+        names the rule categories (版权/禁播/时间冲突/节目冷却/赞助规则).
+        """
+        slot = self.conn.execute("SELECT * FROM slots WHERE id=?", (slot_id,)).fetchone()
+        if not slot:
+            raise DomainError("排期不存在")
+        if slot["status"] != "planned":
+            raise DomainError("只能为尚未播出且状态为 planned 的排期生成换播建议")
+        programs = self.conn.execute(
+            "SELECT * FROM programs WHERE active=1 AND duration_minutes=? AND id!=? ORDER BY id",
+            (slot["duration_minutes"], slot["program_id"]),
+        ).fetchall()
+        candidates: list[dict] = []
+        rejected: list[dict] = []
+        for program in programs:
+            entry = {
+                "program_id": program["id"],
+                "title": program["title"],
+                "kind": program["kind"],
+                "sponsor": program["sponsor"],
+                "duration_minutes": program["duration_minutes"],
+            }
+            entry.update(self._spacing(slot["air_date"], slot["start_time"], program, slot["region"], slot_id))
+            issues = self._slot_issues(slot["air_date"], slot["start_time"], slot["duration_minutes"],
+                                       program["id"], slot["region"], slot_id)
+            if issues:
+                entry["issues"] = issues
+                rejected.append(entry)
+            else:
+                candidates.append(entry)
+
+        def slack(entry: dict) -> int:
+            return sum(entry[key] if entry[key] is not None else self._UNCONSTRAINED
+                       for key in ("cooldown_margin", "sponsor_margin"))
+
+        # 候选按冷却/赞助剩余间隔（余量）从大到小排，越安全越靠前；
+        # 被拒节目按还需补齐的间隔升序，差一点就合规的排前面。
+        candidates.sort(key=lambda e: (-slack(e), e["program_id"]))
+        rejected.sort(key=lambda e: (e["cooldown_remaining"] + e["sponsor_remaining"], e["program_id"]))
+        blocked_by = sorted({issue["category"] for entry in rejected for issue in entry["issues"]})
+        if candidates:
+            message = ""
+            blocked_by = []
+        elif rejected:
+            message = "没有可替换的节目，受阻原因: " + "、".join(blocked_by)
+        else:
+            message = "没有同时长的节目可作为候选"
+        return {
+            "slot": self.get_slot(slot_id),
+            "candidates": candidates,
+            "rejected": rejected,
+            "blocked_by": blocked_by,
+            "message": message,
+        }
 
     def get_slot(self, slot_id: int) -> dict:
         row = self.conn.execute(

@@ -57,8 +57,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not date:
                     raise DomainError("缺少 date 参数")
                 return self._json(200, {"exceptions": self.db.get_exceptions(date)})
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "suggestions":
+                try:
+                    slot_id = int(parts[2])
+                except ValueError as exc:
+                    raise DomainError("排期 ID 必须是数字") from exc
+                return self._json(200, self.db.suggest_replacements(slot_id))
             self._json(404, {"ok": False, "error": "接口不存在"})
-        except DomainError as exc:
+        except (DomainError, ValueError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
 
     def do_POST(self):

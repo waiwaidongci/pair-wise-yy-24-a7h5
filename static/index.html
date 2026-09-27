@@ -21,15 +21,46 @@ button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;ma
 <input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换节目 ID"><input id="actualstart" value="12:00">
 <input id="actualduration" type="number" value="30" placeholder="实播分钟"><input id="actualpid" type="number" placeholder="实播节目 ID，可空"></div>
 <button onclick="schedule()">排期</button><button onclick="replace()">替换</button><button onclick="playout()">记录实播</button><button onclick="reconcile()">对账</button><pre id="result"></pre></section>
+<section><h2>安全换播建议</h2>
+<div><input id="sugslot" type="number" placeholder="排期 ID"><button onclick="suggest()">获取换播建议</button></div>
+<div id="sug"></div></section>
 <script>
 const api=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();out(j);return j};
 const out=x=>document.querySelector('#result').textContent=JSON.stringify(x,null,2);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtMargin=m=>m==null?'无限制':'余量 '+m+' 分钟';
 async function load(){document.querySelector('#state').textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
 function addProgram(){api('/api/programs',{title:title.value,kind:kind.value,duration_minutes:+duration.value,start_date:start.value,end_date:end.value,region:region.value,regions:[region.value],sponsor:sponsor.value||null,cooldown_minutes:+cooldown.value})}
 function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:starttime.value,program_id:+pid.value,region:region.value})}
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
 function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
 function reconcile(){api('/api/reconcile',{date:airdate.value})}
+async function suggest(){
+  const r=await fetch('/api/slots/'+(+sugslot.value)+'/suggestions');
+  const j=await r.json();
+  const box=document.querySelector('#sug');
+  if(j.error){box.innerHTML='<p style="color:#b00">'+esc(j.error)+'</p>';return}
+  const s=j.slot;
+  let h='<h3>排期 #'+s.id+'（'+esc(s.air_date)+' '+esc(s.start_time)+' · '+esc(s.region)+' · '+s.duration_minutes+' 分钟 · 当前节目 #'+s.program_id+' '+esc(s.title)+'）</h3>';
+  if(j.message)h+='<p style="color:#b00"><b>'+esc(j.message)+'</b></p>';
+  if(j.candidates.length){
+    h+='<h4>可替换节目（按赞助和节目冷却的剩余间隔排序，越安全越靠前）</h4><table border="1" cellpadding="6" cellspacing="0"><tr><th>节目</th><th>类型</th><th>赞助商</th><th>冷却剩余间隔</th><th>赞助剩余间隔</th><th></th></tr>';
+    for(const c of j.candidates)
+      h+='<tr><td>#'+c.program_id+' '+esc(c.title)+'</td><td>'+esc(c.kind)+'</td><td>'+esc(c.sponsor||'—')+'</td><td>'+fmtMargin(c.cooldown_margin)+'</td><td>'+fmtMargin(c.sponsor_margin)+'</td><td><button onclick="adopt('+s.id+','+c.program_id+')">采纳</button></td></tr>';
+    h+='</table>';
+  }
+  if(j.rejected.length){
+    h+='<h4>其他节目为何不合适</h4><table border="1" cellpadding="6" cellspacing="0"><tr><th>节目</th><th>原因</th></tr>';
+    for(const r2 of j.rejected)
+      h+='<tr><td>#'+r2.program_id+' '+esc(r2.title)+'</td><td>'+r2.issues.map(i=>'['+esc(i.category)+'] '+esc(i.detail)).join('<br>')+'</td></tr>';
+    h+='</table>';
+  }
+  box.innerHTML=h;
+}
+async function adopt(slotId,programId){
+  await api('/api/slots/'+slotId+'/replace',{new_program_id:programId});
+  suggest();load();
+}
 load();
 </script>
 </html>

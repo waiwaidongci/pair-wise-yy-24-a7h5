@@ -31,6 +31,7 @@ python -m unittest discover -s tests -v
 - `POST /api/programs/{id}/regions`：追加地区授权
 - `POST /api/schedule`：创建排期
 - `POST /api/slots/{id}/replace`：替换计划节目并重新校验
+- `GET /api/slots/{id}/suggestions`：安全换播建议。选中尚未播出的排期后，列出同日期、同地区、同时长的可替换节目，按赞助和节目冷却的剩余间隔排序（余量越大越安全），并说明其他节目被版权、禁播、时间冲突、节目冷却或赞助规则挡住的原因；没有候选项时给出受阻规则分类。编辑采纳后仍走上面的 replace 接口更新排期
 - `POST /api/playout`：登记实播记录
 - `POST /api/reconcile`：按日期生成漏播、错播、时长偏差和超授权异常
 
