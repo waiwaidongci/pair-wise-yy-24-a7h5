@@ -8,6 +8,7 @@ section{background:white;padding:16px;margin:12px 0;border:1px solid #ddd;border
 input,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}
 button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;max-height:360px;overflow:auto}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input{width:90%}
+#sug div{margin:6px 0}.warn{font-weight:bold;color:#8a2b06}.ok{color:#1d6b3a}
 </style>
 <h1>电台播出与版权窗口排程</h1>
 <section><h2>当前计划</h2><button onclick="load()">刷新</button><pre id="state"></pre></section>
@@ -21,6 +22,9 @@ button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;ma
 <input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换节目 ID"><input id="actualstart" value="12:00">
 <input id="actualduration" type="number" value="30" placeholder="实播分钟"><input id="actualpid" type="number" placeholder="实播节目 ID，可空"></div>
 <button onclick="schedule()">排期</button><button onclick="replace()">替换</button><button onclick="playout()">记录实播</button><button onclick="reconcile()">对账</button><pre id="result"></pre></section>
+<section><h2>安全换播建议</h2>
+<div><input id="sugsid" type="number" placeholder="尚未播出的排期 ID"><button onclick="suggest()">查找可替换节目</button></div>
+<div id="sug"></div></section>
 <script>
 const api=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();out(j);return j};
 const out=x=>document.querySelector('#result').textContent=JSON.stringify(x,null,2);
@@ -30,6 +34,41 @@ function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:start
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
 function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
 function reconcile(){api('/api/reconcile',{date:airdate.value})}
+const CAT={duration:'时长不符',license:'版权授权',blocked:'禁播时段',conflict:'时间冲突',cooldown:'节目冷却',sponsor:'赞助规则',current:'当前节目'};
+const el=(t,txt)=>{const e=document.createElement(t);if(txt!=null)e.textContent=txt;return e};
+async function suggest(){
+  const r=await fetch('/api/slots/'+(+sugsid.value)+'/suggestions');
+  const j=await r.json();
+  sug.innerHTML='';
+  if(!r.ok){out(j);return}
+  const s=j.slot;
+  sug.appendChild(el('p',`排期 #${s.id} · ${s.air_date} ${s.start_time} · ${s.duration_minutes} 分钟 · ${s.region} · 当前节目《${s.title}》`));
+  if(j.summary){const d=el('p',j.summary);d.className='warn';sug.appendChild(d)}
+  if(j.candidates.length){
+    sug.appendChild(el('h3','可替换节目（按赞助/节目冷却剩余间隔从宽到紧排序）'));
+    j.candidates.forEach(c=>{
+      const sm=c.sponsor_margin==null?'无赞助间隔限制':`赞助间隔剩余富余 ${c.sponsor_margin} 分钟`;
+      const cm=c.cooldown_margin==null?'无冷却限制':`冷却剩余富余 ${c.cooldown_margin} 分钟`;
+      const d=el('div');
+      const t=el('span',`#${c.program_id} 《${c.title}》 ${c.kind} · ${sm} · ${cm} `);t.className='ok';
+      d.appendChild(t);
+      const b=el('button','采纳');b.onclick=()=>adopt(s.id,c.program_id);d.appendChild(b);
+      sug.appendChild(d);
+    });
+  }
+  if(j.ineligible.length){
+    sug.appendChild(el('h3','不合适的节目及原因'));
+    j.ineligible.forEach(c=>{
+      const txt=c.reasons.map(r=>`[${CAT[r.category]||r.category}] ${r.message}`+(r.remaining!=null?`（还差 ${r.remaining} 分钟）`:'')).join('；');
+      sug.appendChild(el('div',`#${c.program_id} 《${c.title}》：${txt}`));
+    });
+  }
+}
+async function adopt(sid,pid){
+  const r=await fetch('/api/slots/'+sid+'/replace',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({new_program_id:pid})});
+  const j=await r.json();out(j);load();
+  if(j.ok){sug.innerHTML='';sug.appendChild(el('p',`已采纳建议，排期 #${sid} 已更新为节目 #${pid}`))}
+}
 load();
 </script>
 </html>

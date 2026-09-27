@@ -13,6 +13,15 @@ class DomainError(ValueError):
 
 PROGRAM_KINDS = {"music", "ad", "talk", "live"}
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+CATEGORY_LABELS = {
+    "duration": "时长不符",
+    "license": "版权授权",
+    "blocked": "禁播时段",
+    "conflict": "时间冲突",
+    "cooldown": "节目冷却",
+    "sponsor": "赞助规则",
+    "current": "当前节目",
+}
 
 
 def _minutes(value: str) -> int:
@@ -195,7 +204,7 @@ class RadioDB:
     def _validate_slot(self, air_date: str, start_time: str, duration: int, program_id: int,
                        region: str, ignore_slot_id: int | None = None) -> None:
         try:
-            day = datetime.strptime(air_date, "%Y-%m-%d").date()
+            datetime.strptime(air_date, "%Y-%m-%d").date()
         except ValueError as exc:
             raise DomainError("播出日期必须使用 YYYY-MM-DD") from exc
         try:
@@ -207,14 +216,37 @@ class RadioDB:
         program = self.conn.execute("SELECT * FROM programs WHERE id=? AND active=1", (program_id,)).fetchone()
         if not program:
             raise DomainError("节目不存在或未启用")
+        violations, _, _ = self._placement_checks(air_date, start_time, duration, program, region, ignore_slot_id)
+        if violations:
+            raise DomainError(violations[0]["message"])
+
+    def _placement_checks(self, air_date: str, start_time: str, duration: int, program,
+                          region: str, ignore_slot_id: int | None = None) -> tuple[list[dict], int | None, int | None]:
+        """Collect every rule violation for placing `program` into a slot.
+
+        Returns (violations, cooldown_margin, sponsor_margin). Each violation is
+        {"category", "message", "remaining"}; `remaining` is the shortfall in
+        minutes for cooldown/sponsor breaches. Margins are the slack in minutes
+        beyond the required cooldown/sponsor gaps (None when the rule does not
+        apply or no constraining slot exists).
+        """
+        violations: list[dict] = []
+        cooldown_margin: int | None = None
+        sponsor_margin: int | None = None
         if program["duration_minutes"] != duration:
-            raise DomainError(f"排期时长必须等于节目时长 {program['duration_minutes']} 分钟")
+            violations.append({
+                "category": "duration",
+                "message": f"排期时长必须等于节目时长 {program['duration_minutes']} 分钟",
+                "remaining": None,
+            })
+            return violations, cooldown_margin, sponsor_margin
+        day = datetime.strptime(air_date, "%Y-%m-%d").date()
         if not (program["start_date"] <= air_date <= program["end_date"]):
-            raise DomainError("播出日期超出授权窗口")
+            violations.append({"category": "license", "message": "播出日期超出授权窗口", "remaining": None})
         if not self.conn.execute(
-            "SELECT 1 FROM program_regions WHERE program_id=? AND region=?", (program_id, region)
+            "SELECT 1 FROM program_regions WHERE program_id=? AND region=?", (program["id"], region)
         ).fetchone():
-            raise DomainError(f"节目未授权在{region}播出")
+            violations.append({"category": "license", "message": f"节目未授权在{region}播出", "remaining": None})
         end_minutes = _minutes(start_time) + duration
         blocked = self.conn.execute(
             "SELECT * FROM blocked_windows WHERE region=? AND weekday=?",
@@ -222,7 +254,7 @@ class RadioDB:
         ).fetchall()
         for window in blocked:
             if _minutes(window["start_time"]) < end_minutes and _minutes(start_time) < _minutes(window["end_time"]):
-                raise DomainError(f"与禁播时段冲突: {window['reason']}")
+                violations.append({"category": "blocked", "message": f"与禁播时段冲突: {window['reason']}", "remaining": None})
         sql = "SELECT * FROM slots WHERE air_date=? AND region=? AND status!='cancelled'"
         params: list[object] = [air_date, region]
         if ignore_slot_id is not None:
@@ -230,32 +262,46 @@ class RadioDB:
             params.append(ignore_slot_id)
         for existing in self.conn.execute(sql, params).fetchall():
             if _overlap(start_time, duration, existing["start_time"], existing["duration_minutes"]):
-                raise DomainError(f"与排期 #{existing['id']} 时间重叠")
+                violations.append({"category": "conflict", "message": f"与排期 #{existing['id']} 时间重叠", "remaining": None})
         if program["cooldown_minutes"]:
             previous = self.conn.execute(
                 "SELECT * FROM slots WHERE air_date=? AND region=? AND program_id=? AND status!='cancelled' AND id!=? "
                 "AND start_time < ? ORDER BY start_time DESC LIMIT 1",
-                (air_date, region, program_id, ignore_slot_id or -1, start_time),
+                (air_date, region, program["id"], ignore_slot_id or -1, start_time),
             ).fetchone()
             if previous:
                 gap = _minutes(start_time) - (_minutes(previous["start_time"]) + previous["duration_minutes"])
+                cooldown_margin = gap - program["cooldown_minutes"]
                 if gap < program["cooldown_minutes"]:
-                    raise DomainError(f"与上一期节目间隔不足冷却时间 {program['cooldown_minutes']} 分钟")
+                    violations.append({
+                        "category": "cooldown",
+                        "message": f"与上一期节目间隔不足冷却时间 {program['cooldown_minutes']} 分钟",
+                        "remaining": program["cooldown_minutes"] - gap,
+                    })
         if program["sponsor"]:
             policy = self.conn.execute("SELECT min_gap_minutes FROM sponsor_policies WHERE sponsor=?", (program["sponsor"],)).fetchone()
             if policy:
-                gap = policy["min_gap_minutes"]
+                required = policy["min_gap_minutes"]
                 all_sponsored = self.conn.execute(
                     "SELECT s.*, p.sponsor FROM slots s JOIN programs p ON p.id=s.program_id "
                     "WHERE s.air_date=? AND s.region=? AND s.status!='cancelled' AND p.sponsor=? AND s.id!=?",
                     (air_date, region, program["sponsor"], ignore_slot_id or -1),
                 ).fetchall()
-                for other in all_sponsored:
-                    if _overlap(start_time, duration, other["start_time"], other["duration_minutes"]):
-                        raise DomainError(f"与赞助商 {program['sponsor']} 的其他节目冲突")
-                    distance = abs(_minutes(start_time) - (_minutes(other["start_time"]) + other["duration_minutes"]))
-                    if distance < gap:
-                        raise DomainError(f"与赞助商 {program['sponsor']} 的节目间隔不足 {gap} 分钟")
+                # Overlapping same-sponsor slots are already reported as time conflicts above.
+                distances = [
+                    abs(_minutes(start_time) - (_minutes(other["start_time"]) + other["duration_minutes"]))
+                    for other in all_sponsored
+                ]
+                if distances:
+                    nearest = min(distances)
+                    sponsor_margin = nearest - required
+                    if nearest < required:
+                        violations.append({
+                            "category": "sponsor",
+                            "message": f"与赞助商 {program['sponsor']} 的节目间隔不足 {required} 分钟",
+                            "remaining": required - nearest,
+                        })
+        return violations, cooldown_margin, sponsor_margin
 
     def schedule_slot(self, air_date: str, start_time: str, program_id: int, region: str) -> int:
         program = self.conn.execute("SELECT duration_minutes FROM programs WHERE id=?", (program_id,)).fetchone()
@@ -293,6 +339,64 @@ class RadioDB:
         if not row:
             raise DomainError("排期不存在")
         return dict(row)
+
+    def suggest_replacements(self, slot_id: int) -> dict:
+        """List safe same-date/region/duration replacements for a planned slot.
+
+        Candidates are sorted safest-first by remaining sponsor/cooldown slack;
+        every other active program comes back with the rules that block it, and
+        when nothing fits, `summary` names the blocking rule categories.
+        """
+        slot = self.conn.execute("SELECT * FROM slots WHERE id=?", (slot_id,)).fetchone()
+        if not slot:
+            raise DomainError("排期不存在")
+        if slot["status"] != "planned":
+            raise DomainError(f"只能为尚未播出的排期提供换播建议（当前状态: {slot['status']}）")
+        air_date, start_time = slot["air_date"], slot["start_time"]
+        duration, region = int(slot["duration_minutes"]), slot["region"]
+        candidates: list[dict] = []
+        ineligible: list[dict] = []
+        for program in self.conn.execute("SELECT * FROM programs WHERE active=1 ORDER BY id").fetchall():
+            base = {
+                "program_id": program["id"],
+                "title": program["title"],
+                "kind": program["kind"],
+                "sponsor": program["sponsor"],
+                "cooldown_minutes": program["cooldown_minutes"],
+            }
+            if program["id"] == slot["program_id"]:
+                ineligible.append({**base, "reasons": [
+                    {"category": "current", "message": "当前排期已在播该节目", "remaining": None},
+                ]})
+                continue
+            violations, cooldown_margin, sponsor_margin = self._placement_checks(
+                air_date, start_time, duration, program, region, slot_id)
+            if violations:
+                ineligible.append({**base, "reasons": violations})
+            else:
+                candidates.append({**base, "cooldown_margin": cooldown_margin, "sponsor_margin": sponsor_margin})
+        unlimited = float("inf")
+        candidates.sort(key=lambda c: (
+            -(c["sponsor_margin"] if c["sponsor_margin"] is not None else unlimited),
+            -(c["cooldown_margin"] if c["cooldown_margin"] is not None else unlimited),
+            c["program_id"],
+        ))
+        summary = None
+        if not candidates:
+            counts = {key: 0 for key in CATEGORY_LABELS if key != "current"}
+            for item in ineligible:
+                for reason in item["reasons"]:
+                    if reason["category"] in counts:
+                        counts[reason["category"]] += 1
+            blocked_by = [f"{CATEGORY_LABELS[key]} {count} 个" for key, count in counts.items() if count]
+            summary = ("没有可替换的节目，被挡原因: " + "、".join(blocked_by)) if blocked_by \
+                else "没有可替换的节目: 没有其他可用节目"
+        return {
+            "slot": self.get_slot(slot_id),
+            "candidates": candidates,
+            "ineligible": ineligible,
+            "summary": summary,
+        }
 
     def record_playout(self, slot_id: int, actual_start: str, actual_duration_minutes: int,
                        actual_program_id: int | None = None, note: str = "") -> int:
